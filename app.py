@@ -1,1296 +1,1277 @@
-# app.py — Streamlit Stock Analysis (ML + TA)
-# pip install -q streamlit yfinance pandas-ta lightgbm optuna plotly google-generativeai
-
 import os
+import json
+import math
 import warnings
-from typing import Tuple, Dict, Any, List
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
-import yfinance as yf
-import lightgbm as lgb
-import optuna
-import plotly.graph_objects as go
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, r2_score, accuracy_score
+from datetime import datetime
 
 import streamlit as st
+import yfinance as yf
+import ta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# Load environment variables
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Helper function to get API key from various sources
-def get_gemini_api_key():
-    """Get Gemini API key from Streamlit secrets, env var, or return empty string"""
-    # Try Streamlit secrets first (for cloud deployment)
-    try:
-        return st.secrets.get("GEMINI_API_KEY", "")
-    except (FileNotFoundError, KeyError):
-        # Fallback to environment variable (for local development)
-        return os.getenv("GEMINI_API_KEY", "")
-
-# ============== Streamlit Setup ==============
-st.set_page_config(
-    page_title="Professional Stock Analyzer v11 (ML + TA + Risk)", 
-    layout="wide",
-    initial_sidebar_state="expanded"
+# ML
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    log_loss,
 )
-warnings.filterwarnings("ignore")
-optuna.logging.set_verbosity(optuna.logging.ERROR)
-pd.options.display.float_format = "{:.5f}".format
 
-# ============== Optional Gemini ==============
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ====== Gemini (opsional) ======
 try:
     import google.generativeai as genai
+
+    if os.getenv("GEMINI_API_KEY"):
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        _HAS_GEMINI = True
+    else:
+        _HAS_GEMINI = False
 except Exception:
-    genai = None
+    _HAS_GEMINI = False
+
+# ====== Optuna default ON (20 trials) ======
+_USE_OPTUNA = True
+OPTUNA_TRIALS = 20
+try:
+    import optuna
+    from optuna.pruners import MedianPruner
+except Exception:
+    _USE_OPTUNA = False
+
+# =====================
+# Konstanta Global
+# =====================
+LOOKBACK = "3y"        # tetap 3y
+HORIZON = 1
+LABEL_METHOD = "fixed"
+UP_TH = 0.0025
+DOWN_TH = -0.0025
+TRIPLE_PT = 1.5
+TRIPLE_SL = 1.0
+TX_COST = 0.0005
+WINDOW = 48
+N_SPLITS = 3
+GAP = 3
+
+IDX2LAB = {0: "Down", 1: "Flat", 2: "Up"}
 
 
-# =========================
-# Util umum: sanitasi OHLCV
-# =========================
-def _flatten_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        if set(["Open", "High", "Low", "Close", "Volume", "Adj Close"]).issubset(
-            set(out.columns.get_level_values(0))
-        ):
-            out.columns = out.columns.get_level_values(0)
-        else:
-            out.columns = [
-                "_".join([str(x) for x in tup if x is not None]).strip("_")
-                for tup in out.columns
-            ]
-    return out
-
-
-def _sanitize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    df = _flatten_ohlcv_columns(df)
-    rename_map = {c: c.title() for c in df.columns}
-    df = df.rename(columns=rename_map)
-
-    cols = [
-        c
-        for c in ["Open", "High", "Low", "Close", "Volume", "Adj Close"]
-        if c in df.columns
-    ]
-    df = df[cols].copy()
-
-    if not isinstance(df.index, pd.DatetimeIndex):
+# =====================
+# Helpers & Core Logic
+# =====================
+def fetch_ticker_data(ticker: str, lookback: str) -> pd.DataFrame:
+    periods = [lookback, "2y", "5y", "max"]
+    for p in periods:
         try:
-            df.index = pd.to_datetime(df.index, errors="coerce")
+            df = yf.download(
+                ticker,
+                period=p,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
+            if df is not None and not df.empty and len(df) > 252:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                df.index = pd.to_datetime(df.index)
+                for c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                if p != lookback:
+                    cutoff = pd.Timestamp.now() - pd.DateOffset(
+                        days=int(float(lookback[:-1]) * 365.25)
+                    )
+                    df = df.loc[df.index >= cutoff]
+
+                return df.dropna()
         except Exception:
             pass
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-
-    for c in df.columns:
-        ser = df[c]
-        if isinstance(ser, pd.DataFrame):
-            ser = ser.iloc[:, 0]
-        df[c] = pd.to_numeric(ser, errors="coerce")
-
-    if "Volume" in df.columns:
-        df["Volume"] = df["Volume"].fillna(0)
-
-    need = [x for x in ["Open", "High", "Low", "Close"] if x in df.columns]
-    if need:
-        df = df.dropna(subset=need)
-
-    return df
+    raise ValueError(f"Data kosong untuk {ticker}")
 
 
-# ==============
-# Util: Tick BEI
-# ==============
-def round_to_idx_tick_size(price: float) -> int:
-    price = float(price)
-    if price < 200:
-        tick = 1
-    elif price < 500:
-        tick = 2
-    elif price < 2000:
-        tick = 5
-    elif price < 5000:
-        tick = 10
-    else:
-        tick = 25
-    return int(round(price / tick) * tick)
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    X = df.copy()
+    # Returns & realized vol
+    X["ret1"] = X["Close"].pct_change()
+    X["ret2"] = X["Close"].pct_change(2)
+    X["ret5"] = X["Close"].pct_change(5)
+    X["ret10"] = X["Close"].pct_change(10)
+    X["logret1"] = np.log(X["Close"]).diff()
+    X["rv5"] = X["ret1"].rolling(5).std()
+    X["rv20"] = X["ret1"].rolling(20).std()
+    X["rv60"] = X["ret1"].rolling(60).std()
+
+    # Volume z-score
+    vol_ma20 = X["Volume"].rolling(20).mean()
+    vol_std20 = X["Volume"].rolling(20).std()
+    X["vol_z"] = (X["Volume"] - vol_ma20) / (vol_std20 + 1e-9)
+
+    # VWAP distance
+    vwap = (X["High"] + X["Low"] + X["Close"]) / 3
+    X["vwap_dist"] = X["Close"] / vwap - 1
+
+    # Indicators (ta)
+    X["rsi14"] = ta.momentum.RSIIndicator(X["Close"], 14).rsi()
+    stoch = ta.momentum.StochasticOscillator(X["High"], X["Low"], X["Close"])
+    X["stoch_k"] = stoch.stoch()
+    X["stoch_d"] = stoch.stoch_signal()
+
+    macd = ta.trend.MACD(X["Close"])
+    X["macd"] = macd.macd()
+    X["macd_signal"] = macd.macd_signal()
+    X["macd_hist"] = macd.macd_diff()
+
+    ppo = ta.momentum.PercentagePriceOscillator(X["Close"])
+    X["ppo"] = ppo.ppo()
+    X["ppos"] = ppo.ppo_signal()
+    X["ppoh"] = ppo.ppo_hist()
+
+    bb = ta.volatility.BollingerBands(X["Close"])
+    X["bbl"] = bb.bollinger_lband()
+    X["bbm"] = bb.bollinger_mavg()
+    X["bbu"] = bb.bollinger_hband()
+    X["bbb"] = bb.bollinger_pband()
+    X["bbp"] = bb.bollinger_wband()
+
+    atr = ta.volatility.AverageTrueRange(X["High"], X["Low"], X["Close"])
+    X["atr14"] = atr.average_true_range()
+
+    X["mfi14"] = ta.volume.MFIIndicator(
+        X["High"], X["Low"], X["Close"], X["Volume"]
+    ).money_flow_index()
+    X["obv"] = ta.volume.OnBalanceVolumeIndicator(
+        X["Close"], X["Volume"]
+    ).on_balance_volume()
+    X["cmf20"] = ta.volume.ChaikinMoneyFlowIndicator(
+        X["High"], X["Low"], X["Close"], X["Volume"]
+    ).chaikin_money_flow()
+
+    X["adx14"] = ta.trend.ADXIndicator(
+        X["High"], X["Low"], X["Close"]
+    ).adx()
+    X["cci20"] = ta.trend.CCIIndicator(
+        X["High"], X["Low"], X["Close"]
+    ).cci()
+    X["willr14"] = ta.momentum.WilliamsRIndicator(
+        X["High"], X["Low"], X["Close"]
+    ).williams_r()
+
+    for w in [8, 21, 50, 200]:
+        X[f"ema{w}"] = ta.trend.EMAIndicator(X["Close"], w).ema_indicator()
+        X[f"ema{w}_slope"] = X[f"ema{w}"].pct_change()
+        X[f"ema{w}_gap"] = X["Close"] / X[f"ema{w}"] - 1
+
+    X["skew20"] = X["ret1"].rolling(20).skew()
+    X["kurt20"] = X["ret1"].rolling(20).kurt()
+
+    X["dow"] = X.index.dayofweek
+    X["dom"] = X.index.day
+    X["mon"] = X.index.month
+    X["is_month_end"] = X.index.is_month_end.astype(int)
+    return X
 
 
-# ==========================
-# 1.1) ML Feature Engineering (ENHANCED)
-# ==========================
-def make_features_ml(
-    df_merged_lower: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    df = df_merged_lower.copy()
+def make_labels_fixed(df: pd.DataFrame, h: int, up: float, down: float) -> pd.Series:
+    fwd = df["Close"].shift(-h) / df["Close"] - 1
+    lab = np.where(fwd > up, 2, np.where(fwd < down, 0, 1))
+    return pd.Series(lab, index=df.index, name=f"y_{h}d")
 
-    df.ta.rsi(14, append=True)
-    df.ta.macd(append=True)
-    df.ta.bbands(20, append=True)
-    df.ta.atr(14, append=True)
-    df.ta.mfi(14, append=True)
-    df.ta.adx(14, append=True)
-    df.ta.stoch(append=True)
-    df.ta.ema(20, append=True)
-    df.ta.ema(50, append=True)
 
-    for lag in [1, 2, 3, 5, 10, 21]:
-        df[f"ret_{lag}d"] = df["close"].pct_change(lag)
+def make_labels_triple_barrier(df: pd.DataFrame, h: int, pt: float, sl: float) -> pd.Series:
+    if "ret1" not in df.columns:
+        df["ret1"] = df["Close"].pct_change()
+    vol = df["ret1"].rolling(20).std().shift(1).bfill()
+    labels = []
+    idx = list(df.index)
+    for i in range(len(idx)):
+        if i >= len(idx) - h:
+            labels.append(np.nan)
+            continue
+        entry = df["Close"].iloc[i]
+        v = vol.iloc[i] or 0.01
+        up_bar = entry * (1 + pt * v)
+        dn_bar = entry * (1 - sl * v)
+        path = df["Close"].iloc[i + 1 : i + 1 + h]
+        hit_up = (path >= up_bar).any()
+        hit_dn = (path <= dn_bar).any()
+        if hit_up and not hit_dn:
+            labels.append(2)
+        elif hit_dn and not hit_up:
+            labels.append(0)
+        else:
+            ret = path.iloc[-1] / entry - 1
+            labels.append(2 if ret > 0 else (0 if ret < 0 else 1))
+    return pd.Series(labels, index=df.index, name=f"y_tb_{h}d")
 
-    for win in [5, 10, 20]:
-        df[f"roll_mean_{win}"] = df["close"].rolling(win).mean()
-        df[f"roll_std_{win}"] = df["close"].rolling(win).std()
-        df[f"roll_min_{win}"] = df["close"].rolling(win).min()
-        df[f"roll_max_{win}"] = df["close"].rolling(win).max()
-        df[f"zscore_{win}"] = (df["close"] - df[f"roll_mean_{win}"]) / (
-            df[f"roll_std_{win}"] + 1e-9
+
+def make_sequences(Z: np.ndarray, yy: np.ndarray, win: int):
+    Xs, ys = [], []
+    if len(Z) > win:
+        for i in range(win, len(Z)):
+            Xs.append(Z[i - win : i])
+            ys.append(yy[i])
+    return np.asarray(Xs, np.float32), np.asarray(ys, np.int64)
+
+
+def temp_scale_probs(p, grid=np.linspace(0.5, 3.0, 26)):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    p = p / p.sum(axis=1, keepdims=True)
+    best_T = 1.0
+    best_ll = np.inf
+    for T in grid:
+        logits = np.log(p)
+        sm = np.exp(logits / T)
+        sm /= sm.sum(axis=1, keepdims=True)
+        ll = -np.mean(
+            np.log(np.clip(sm[np.arange(len(sm)), sm.argmax(1)], 1e-9, 1.0))
         )
-
-    if "close_jkse" in df.columns:
-        df["rel_str_jkse"] = df["close"] / (df["close_jkse"] + 1e-9)
-        df["ret_jkse_1d"] = df["close_jkse"].pct_change(1)
-        df["ret_jkse_5d"] = df["close_jkse"].pct_change(5)
-    if "close_vix" in df.columns:
-        df["ret_vix_1d"] = df["close_vix"].pct_change(1)
-
-    df["target_return"] = df["close"].pct_change().shift(-1)
-
-    df_for_pred = df.iloc[-2:].copy()
-    df = df.replace([np.inf, -np.inf], np.nan).dropna()
-
-    X = df.drop(columns=["target_return"])
-    y = df["target_return"]
-    if X.empty or y.empty:
-        raise ValueError("Data tidak cukup setelah feature engineering ML.")
-    return X, y, df_for_pred
+        if ll < best_ll:
+            best_ll = ll
+            best_T = T
+    sm = np.exp(np.log(p) / best_T)
+    sm /= sm.sum(axis=1, keepdims=True)
+    return sm, best_T
 
 
-# =====================================================
-# 1.2) ML Walk-forward CV + Embargo + Optuna tuning
-# =====================================================
-def tune_and_backtest_ml(
-    X: pd.DataFrame,
-    y: pd.Series,
-    embargo: int = 5,
-    n_splits: int = 5,
-    n_trials: int = 40,
-):
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    scaler = StandardScaler()
+def weight_search(probs_list, y_true):
+    grid = np.linspace(0.0, 1.0, 11)
+    best_w = None
+    best_ll = np.inf
+    for w1 in grid:
+        for w2 in grid:
+            for w3 in grid:
+                w4 = 1.0 - w1 - w2 - w3
+                if w4 < 0:
+                    continue
+                P = (
+                    w1 * probs_list[0]
+                    + w2 * probs_list[1]
+                    + w3 * probs_list[2]
+                    + w4 * probs_list[3]
+                )
+                ll = log_loss(y_true, P, labels=[0, 1, 2])
+                if ll < best_ll:
+                    best_ll = ll
+                    best_w = (w1, w2, w3, w4)
+    return best_w
 
-    splits = []
-    idx = np.arange(len(X))
-    for tr, va in tscv.split(idx):
-        if embargo > 0:
-            va = va[embargo:] if len(va) > embargo else va
-            if len(va) == 0:
-                continue
-        splits.append((tr, va))
-    if not splits:
-        raise ValueError("Tidak ada split validasi yang tersisa setelah embargo.")
 
-    def objective(trial):
-        params = {
-            "objective": "regression_l1",
-            "metric": "mae",
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 63),
-            "max_depth": trial.suggest_int("max_depth", 4, 12),
-            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
-            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
-            "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 120),
-            "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
-            "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 5.0),
-            "seed": 42,
-            "verbose": -1,
-            "n_jobs": -1,
-        }
-        thr = trial.suggest_float("dir_threshold", -0.002, 0.002)
+def fetch_marketaux_news_df(ticker: str, limit: int = 40) -> pd.DataFrame:
+    key = os.getenv("MARKETAUX_API_KEY")
+    if not key:
+        return pd.DataFrame(columns=["date", "title", "desc"])
 
-        wr = []
-        for tr, va in splits:
-            X_tr, X_va = X.iloc[tr], X.iloc[va]
-            y_tr, y_va = y.iloc[tr], y.iloc[va]
+    import requests
 
-            Xtr = scaler.fit_transform(X_tr)
-            Xva = scaler.transform(X_va)
+    params = {
+        "api_token": key,
+        "limit": limit,
+        "language": "en,id",
+        "countries": "id",
+        "filter_entities": "true",
+    }
 
-            dtr = lgb.Dataset(Xtr, label=y_tr)
-            dva = lgb.Dataset(Xva, label=y_va, reference=dtr)
+    if ticker == "^JKSE":
+        params[
+            "search"
+        ] = 'IHSG OR "IDX Composite" OR "Jakarta Composite" OR "Bursa Efek Indonesia"'
+    else:
+        params["symbols"] = ticker
 
-            model = lgb.train(
-                params,
-                dtr,
-                valid_sets=[dva],
-                num_boost_round=1500,
-                callbacks=[lgb.early_stopping(100, verbose=False)],
+    base_url = "https://api.marketaux.com/v1/news/all"
+
+    try:
+        r = requests.get(base_url, params=params, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        rows = []
+        for it in js.get("data", []):
+            dt = pd.to_datetime(
+                it.get("published_at", it.get("published_on")), utc=True
             )
-            pred = model.predict(Xva, num_iteration=model.best_iteration)
-            pred_dir = (pred > thr).astype(int)
-            actual_dir = (y_va > 0).astype(int)
-            wr.append(accuracy_score(actual_dir, pred_dir))
-        return float(np.mean(wr))
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials)
-    best_params = study.best_params.copy()
-    best_thr = best_params.pop("dir_threshold")
-    best_wr = study.best_value
-    return best_params, best_thr, best_wr, splits
-
-
-# ==========================================
-# 1.3) ML Train final, tables & plots + ENHANCED METRICS
-# ==========================================
-def train_final_and_report_ml(X, y, df_for_pred, best_params, best_thr, splits, ticker):
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    dtrain = lgb.Dataset(X_scaled, label=y)
-
-    final_params = {
-        "objective": "regression_l1",
-        "metric": "mae",
-        "seed": 42,
-        "verbose": -1,
-        "n_jobs": -1,
-        **best_params,
-    }
-    model = lgb.train(final_params, dtrain, num_boost_round=800)
-
-    tr, va = splits[-1]
-    X_hold, y_hold = X.iloc[va], y.iloc[va]
-    Xh = scaler.transform(X_hold)
-    pred_ret = model.predict(Xh)
-    close_t = X_hold["close"].values
-    actual_price_t1 = close_t * (1 + y_hold.values)
-    pred_price_t1_raw = close_t * (1 + pred_ret)
-    pred_price_t1 = np.array([round_to_idx_tick_size(p) for p in pred_price_t1_raw])
-
-    df_bt = pd.DataFrame(
-        {
-            "Date_t": X_hold.index,
-            "close_t": close_t,
-            "Pred_close_Tplus1": pred_price_t1,
-            "Actual_close_Tplus1": actual_price_t1,
-            "Pred_return_Tplus1": pred_ret,
-            "Actual_return_Tplus1": y_hold.values,
-        }
-    )
-    df_bt["Selisih"] = df_bt["Pred_close_Tplus1"] - df_bt["Actual_close_Tplus1"]
-    df_bt["ArahPred"] = np.where(
-        df_bt["Pred_return_Tplus1"] > best_thr, "NAIK", "TURUN"
-    )
-    df_bt["ArahActual"] = np.where(df_bt["Actual_return_Tplus1"] > 0, "NAIK", "TURUN")
-    df_bt["Benar?"] = np.where(df_bt["ArahPred"] == df_bt["ArahActual"], "✅", "❌")
-    wr_hold = (df_bt["Benar?"] == "✅").mean()
-
-    # ========== ENHANCED METRICS ==========
-    # 1. Sharpe Ratio (annualized)
-    strategy_returns = df_bt["Pred_return_Tplus1"] * (df_bt["ArahPred"] == "NAIK").astype(int)
-    sharpe_ratio = (strategy_returns.mean() / (strategy_returns.std() + 1e-9)) * np.sqrt(252)
-    
-    # 2. Max Drawdown
-    cumulative_returns = (1 + strategy_returns).cumprod()
-    running_max = cumulative_returns.cummax()
-    drawdown = (cumulative_returns - running_max) / running_max
-    max_drawdown = drawdown.min()
-    
-    # 3. Win/Loss Ratio
-    wins = df_bt[df_bt["Benar?"] == "✅"]
-    losses = df_bt[df_bt["Benar?"] == "❌"]
-    avg_win = wins["Pred_return_Tplus1"].abs().mean() if len(wins) > 0 else 0
-    avg_loss = losses["Pred_return_Tplus1"].abs().mean() if len(losses) > 0 else 1
-    win_loss_ratio = avg_win / (avg_loss + 1e-9)
-    
-    # 4. Profit Factor
-    gross_profit = wins["Pred_return_Tplus1"].sum() if len(wins) > 0 else 0
-    gross_loss = abs(losses["Pred_return_Tplus1"].sum()) if len(losses) > 0 else 1
-    profit_factor = gross_profit / (gross_loss + 1e-9)
-    
-    # 5. Feature Importance
-    feature_importance = pd.DataFrame({
-        'feature': X.columns,
-        'importance': model.feature_importance(importance_type='gain')
-    }).sort_values('importance', ascending=False).head(10)
-
-    recent = df_bt.tail(100)
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=recent["Date_t"],
-            y=recent["Actual_close_Tplus1"],
-            mode="lines+markers",
-            name="Harga Asli (T+1)",
-            line=dict(width=2),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=recent["Date_t"],
-            y=recent["Pred_close_Tplus1"],
-            mode="lines+markers",
-            name="Prediksi Harga ML (T+1)",
-            line=dict(width=2, dash="dot"),
-        )
-    )
-    fig.update_layout(
-        title=f"📈 {ticker} | Prediksi ML vs Aktual (100 titik terbaru)  |  Holdout Win-Rate: {wr_hold:.2%}",
-        xaxis_title="Tanggal",
-        yaxis_title="Harga (Rp)",
-        template="plotly_dark",
-        hovermode="x unified",
-        height=420,
-    )
-
-    # Feature Importance Chart
-    fig_importance = go.Figure()
-    fig_importance.add_trace(
-        go.Bar(
-            x=feature_importance['importance'],
-            y=feature_importance['feature'],
-            orientation='h',
-            marker_color='lightblue'
-        )
-    )
-    fig_importance.update_layout(
-        title=f"🔍 Top 10 Feature Importance - {ticker}",
-        xaxis_title="Importance (Gain)",
-        yaxis_title="Feature",
-        template="plotly_dark",
-        height=400,
-    )
-
-    X_live = df_for_pred.drop(columns=["target_return"], errors="ignore").iloc[[-1]]
-    X_live = X_live.ffill().bfill()
-    Xl = scaler.transform(X_live)
-    live_ret = model.predict(Xl)[0]
-    
-    # Confidence interval estimation (simple bootstrap-like approach)
-    # Using standard error from validation predictions
-    pred_errors = pred_ret - y_hold.values
-    std_error = pred_errors.std()
-    confidence_95_lower = live_ret - 1.96 * std_error
-    confidence_95_upper = live_ret + 1.96 * std_error
-    
-    last_close = X_live["close"].values[0]
-    live_pred_price = round_to_idx_tick_size(last_close * (1 + live_ret))
-    live_pred_lower = round_to_idx_tick_size(last_close * (1 + confidence_95_lower))
-    live_pred_upper = round_to_idx_tick_size(last_close * (1 + confidence_95_upper))
-    arah_live = "NAIK" if live_ret > best_thr else "TURUN"
-
-    ml_metrics = {
-        "Ticker": ticker,
-        "winrate_holdout": wr_hold,
-        "mae_holdout": mean_absolute_error(
-            df_bt["Actual_close_Tplus1"], df_bt["Pred_close_Tplus1"]
-        ),
-        "r2_holdout": r2_score(
-            df_bt["Actual_close_Tplus1"], df_bt["Pred_close_Tplus1"]
-        ),
-        "sharpe_ratio": sharpe_ratio,
-        "max_drawdown": max_drawdown,
-        "win_loss_ratio": win_loss_ratio,
-        "profit_factor": profit_factor,
-    }
-    ml_prediction = {
-        "Ticker": ticker,
-        "ML_Close_T": last_close,
-        "ML_Pred_Return_T+1": live_ret,
-        "ML_Threshold_Arah": best_thr,
-        "ML_Pred_Harga_T+1": live_pred_price,
-        "ML_Pred_Lower_95": live_pred_lower,
-        "ML_Pred_Upper_95": live_pred_upper,
-        "ML_Arah": arah_live,
-    }
-    return ml_metrics, ml_prediction, df_bt, fig, fig_importance, feature_importance
+            rows.append(
+                {
+                    "date": dt.tz_convert(None).normalize(),
+                    "title": it.get("title", ""),
+                    "desc": it.get("description", ""),
+                }
+            )
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame(columns=["date", "title", "desc"])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["date", "title", "desc"])
 
 
-# ==========================================================
-# BLOK 2: FUNGSI-FUNGSI TA-AI
-# ==========================================================
-def compute_indicators_ta(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = _sanitize_ohlcv(df_raw)
-    if df.empty:
-        raise ValueError("Data kosong setelah sanitasi OHLC di compute_indicators_ta")
+def analyze_news_with_gemini(news_df: pd.DataFrame) -> pd.DataFrame:
+    if not _HAS_GEMINI or news_df.empty:
+        return pd.DataFrame(columns=["date", "score"])
 
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
+    try:
+        news_df_gemini = news_df.copy()
+        news_df_gemini["date"] = news_df_gemini["date"].dt.strftime("%Y-%m-%d")
+        payload = news_df_gemini.to_dict("records")
 
-    fast, slow, signal = 12, 26, 9
-    min_bars = max(slow + signal, 35)
-    if len(df) < min_bars:
-        raise ValueError(
-            f"Data terlalu pendek untuk MACD: butuh ≥{min_bars} bar, baru ada {len(df)}."
+        prompt = (
+            "Analyze each news item in the list. Provide: "
+            "1. A numerical market impact score (-1.0 to 1.0). "
+            "2. A categorical sentiment ('Positif', 'Negatif', 'Netral'). "
+            "3. The original 'title'. "
+            'Return STRICT JSON: {"analysis_results": ['
+            '{"date": "YYYY-MM-DD", "title": "...", "score": number, "sentiment": "..."}'
+            "]}"
         )
 
-    macd_df = ta.macd(close, fast=fast, slow=slow, signal=signal, talib=False)
-    have_cols = False
-    if macd_df is not None:
-        need = {"MACD_12_26_9", "MACDs_12_26_9", "MACDh_12_26_9"}
-        have_cols = need.issubset(set(macd_df.columns))
+        # >>>>>> PENTING: Model tetap gemini-2.5-flash-preview-09-2025 <<<<<<
+        model = genai.GenerativeModel("gemini-2.5-flash-preview-09-2025")
+        resp = model.generate_content([json.dumps(payload), prompt])
+        txt = getattr(resp, "text", "{}")
+        if "```json" in txt:
+            txt = txt.split("```json")[1].split("```")[0]
 
-    if have_cols:
-        df["MACD"] = macd_df["MACD_12_26_9"]
-        df["MACD_signal"] = macd_df["MACDs_12_26_9"]
-        df["MACD_hist"] = macd_df["MACDh_12_26_9"]
-    else:
-        ema_fast = close.ewm(span=fast, adjust=False).mean()
-        ema_slow = close.ewm(span=slow, adjust=False).mean()
-        macd_line = ema_fast - ema_slow
-        macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
-        macd_hist = macd_line - macd_signal
-        df["MACD"], df["MACD_signal"], df["MACD_hist"] = (
-            macd_line,
-            macd_signal,
-            macd_hist,
-        )
+        analysis_results = json.loads(txt).get("analysis_results", [])
+        scores_df = pd.DataFrame(analysis_results)
+        if scores_df.empty or "score" not in scores_df.columns:
+            return pd.DataFrame(columns=["date", "score"])
 
-    df["RSI14"] = ta.rsi(close, length=14)
-    df["ATR14"] = ta.atr(high, low, close, length=14)
-    df["EMA20"] = close.ewm(span=20, adjust=False).mean()
-    df["EMA50"] = close.ewm(span=50, adjust=False).mean()
-    df["VolSMA20"] = df["Volume"].rolling(20, min_periods=1).mean()
-
-    return df.dropna()
+        scores_df["date"] = pd.to_datetime(scores_df["date"]).dt.normalize()
+        sent = scores_df.groupby("date")["score"].mean().to_frame()
+        sent = sent.rename(columns={"score": "sent_score"})
+        return sent
+    except Exception:
+        return pd.DataFrame(columns=["sent_score"])
 
 
-def detect_breakout_levels_ta(df_raw, lookback=40):
-    base = _sanitize_ohlcv(df_raw)
-    if base.empty:
-        raise ValueError("Data kosong di detect_breakout_levels_ta")
-
-    base = base[["High", "Low", "Close"]].dropna()
-    win = min(lookback, len(base))
-    recent = base.tail(win)
-    
-    resistance = float(recent["High"].max())
-    support = float(recent["Low"].min())
-    last_close = float(recent["Close"].iloc[-1])
-    height = resistance - support
-
-    # Tentukan tipe plan berdasarkan posisi harga terakhir
-    # Jika harga lebih dekat ke support, plan-nya 'Swing' (beli di support)
-    # Jika harga lebih dekat ke resistance, plan-nya 'Breakout' (beli saat tembus resistance)
-    if abs(last_close - support) < abs(last_close - resistance):
-        plan_type = "Swing"
-    else:
-        plan_type = "Breakout"
-        
-    return resistance, support, height, plan_type, last_close
-
-
-def ta_generate_trade_plan(df_raw, ticker="TICKER", use_ai=False, gemini_key: str = "", ml_winrate=None):
-    df_ind = compute_indicators_ta(df_raw)
-    last = df_ind.dropna().iloc[-1]
-
-    close_t = float(last["Close"])
-    rsi = float(last["RSI14"])
-    macd_hist = float(last["MACD_hist"])
-    atr = float(last["ATR14"])
-    ema20 = float(last["EMA20"])
-    ema50 = float(last["EMA50"])
-    vol = float(last["Volume"])
-    vol_sma20 = float(last["VolSMA20"])
-
-    resistance, support, height, plan_type, last_close = detect_breakout_levels_ta(df_raw, lookback=40)
-
-    bull_votes = 0
-    bull_votes += 1 if ema20 > ema50 else 0
-    bull_votes += 1 if macd_hist > 0 else 0
-    bull_votes += 1 if rsi > 50 else 0
-    view = "BULLISH" if bull_votes >= 2 else "BEARISH"
-
-    # Logika plan dinamis berdasarkan posisi harga
-    if plan_type == "Breakout":
-        # Plan A: Beli saat menembus resistance
-        scenario = "Breakout Bullish"
-        entry_point = resistance
-        tp1 = round_to_idx_tick_size(entry_point + height)
-        tp2 = round_to_idx_tick_size(entry_point + 1.5 * height)
-        stop_loss = round_to_idx_tick_size(max(1.0, entry_point - 1.0 * atr))
-    else: # plan_type == "Swing"
-        # Plan B: Beli di dekat support (mean reversion/swing)
-        scenario = "Swing/Buy on Weakness"
-        entry_point = support
-        tp1 = round_to_idx_tick_size(resistance) # Target utama adalah resistance
-        tp2 = round_to_idx_tick_size(support + 0.5 * height) # Target antara
-        stop_loss = round_to_idx_tick_size(max(1.0, entry_point - 1.0 * atr))
-
-    entry_low = round_to_idx_tick_size(entry_point - 0.3 * atr)
-    entry_high = round_to_idx_tick_size(entry_point + 0.3 * atr)
-    entry_mid = round_to_idx_tick_size((entry_low + entry_high) / 2)
-    
-    # ========== RISK/REWARD ANALYSIS (DATA-DRIVEN) ==========
-    # Risk: Entry ke Stop Loss
-    risk_amount = abs(entry_mid - stop_loss)
-    risk_pct = risk_amount / (entry_mid + 1e-9)
-    
-    # Reward: Entry ke TP1 dan TP2
-    reward_tp1 = abs(tp1 - entry_mid)
-    reward_tp2 = abs(tp2 - entry_mid)
-    reward_tp1_pct = reward_tp1 / (entry_mid + 1e-9)
-    reward_tp2_pct = reward_tp2 / (entry_mid + 1e-9)
-    
-    # Risk/Reward Ratios
-    rr_ratio_tp1 = reward_tp1 / (risk_amount + 1e-9)
-    rr_ratio_tp2 = reward_tp2 / (risk_amount + 1e-9)
-    
-    # REAL WIN PROBABILITY: Use ML model holdout win-rate if available
-    if ml_winrate is not None and 0.4 <= ml_winrate <= 0.8:
-        win_prob = ml_winrate
-        prob_source = "ML Model Holdout"
-    else:
-        # Fallback: Estimate from technical indicators strength
-        # Count bullish signals and normalize
-        ta_score = bull_votes / 3.0  # 0 to 1
-        # Apply sigmoid-like curve: 0.45 to 0.60 range based on TA
-        win_prob = 0.45 + (ta_score * 0.15)
-        prob_source = "TA Indicator Strength"
-    
-    # REAL EXPECTED VALUE: No assumptions, pure math
-    # Expected value per R risked = (win_prob * avg_RR) - (loss_prob * 1)
-    # Assume 70% of wins hit TP1, 30% hit TP2 (conservative distribution)
-    avg_rr = (0.7 * rr_ratio_tp1 + 0.3 * rr_ratio_tp2)
-    expected_value_per_r = (win_prob * avg_rr) - ((1 - win_prob) * 1)
-    expected_return_pct = expected_value_per_r * risk_pct
-    
-    # REAL KELLY CRITERION: Proper formula without arbitrary caps
-    # Kelly = (p * b - q) / b, where p=win_prob, q=loss_prob, b=avg_win/avg_loss
-    # For trading: Kelly = (win_prob * rr_ratio - loss_prob) / rr_ratio
-    kelly_full = (win_prob * avg_rr - (1 - win_prob)) / avg_rr
-    
-    # FRACTIONAL KELLY: Industry standard is 0.25x Kelly (Quarter Kelly)
-    # This is NOT arbitrary capping, it's risk management best practice
-    # Reference: "Fortune's Formula" by William Poundstone
-    kelly_fraction = max(0, kelly_full * 0.25)  # 1/4 Kelly for real-world risk management
-    
-    # Position sizing note
-    if kelly_fraction <= 0:
-        position_note = "Negative EV - Skip trade"
-    elif kelly_fraction < 0.02:
-        position_note = "Very small edge"
-    elif kelly_fraction < 0.05:
-        position_note = "Moderate edge"
-    else:
-        position_note = "Strong edge"
-    
-    vol_note = (
-        "Volume di atas rata-rata (SMA20)"
-        if vol > vol_sma20
-        else "Volume di bawah/sekitar rata-rata"
+def _hline(fig, y, text, row, col, x0=None, x1=None, index=None):
+    if index is None or len(index) == 0:
+        return
+    x0 = x0 or index.min()
+    x1 = x1 or index.max()
+    fig.add_shape(
+        type="line",
+        x0=x0,
+        x1=x1,
+        y0=y,
+        y1=y,
+        line=dict(dash="dot", width=1),
+        row=row,
+        col=col,
+    )
+    fig.add_annotation(
+        x=x1,
+        y=y,
+        text=f"{text} {y:.2f}",
+        showarrow=False,
+        xanchor="left",
+        xshift=8,
+        row=row,
+        col=col,
     )
 
-    plan = {
-        "Ticker": ticker,
-        "Scenario": scenario,
-        "Close_T": round_to_idx_tick_size(close_t),
-        "View": view,
-        "RSI14": round(rsi, 2),
-        "MACD_hist": round(macd_hist, 4),
-        "ATR14": round(atr, 2),
-        "Volume_Note": vol_note,
-        "Support": round_to_idx_tick_size(support),
-        "Resistance": round_to_idx_tick_size(resistance),
-        "Entry_Zone": f"{entry_low} – {entry_high}",
-        "Stop_Loss": stop_loss,
-        "TP1": tp1,
-        "TP2": tp2,
-        # Enhanced metrics (Data-Driven)
-        "Risk_Amount": risk_amount,
-        "Risk_%": round(risk_pct * 100, 2),
-        "Reward_TP1": reward_tp1,
-        "Reward_TP1_%": round(reward_tp1_pct * 100, 2),
-        "Reward_TP2": reward_tp2,
-        "Reward_TP2_%": round(reward_tp2_pct * 100, 2),
-        "RR_Ratio_TP1": round(rr_ratio_tp1, 2),
-        "RR_Ratio_TP2": round(rr_ratio_tp2, 2),
-        "Win_Probability": round(win_prob, 3),
-        "Win_Prob_Source": prob_source,
-        "Expected_Value_per_R": round(expected_value_per_r, 3),
-        "Expected_Return_%": round(expected_return_pct * 100, 2),
-        "Kelly_Full_%": round(kelly_full * 100, 2),
-        "Kelly_Quarter_%": round(kelly_fraction * 100, 2),
-        "Position_Note": position_note,
-    }
 
-    ai_comment = None
-    if use_ai and genai is not None and gemini_key:
-        try:
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            prompt = f"""
-Kamu seorang Certified Technical Analyst & Risk Manager. 
-Buat analisis professional untuk {ticker}.
+def make_dashboard(
+    data,
+    p_up_s,
+    p_dn_s,
+    thr_opt,
+    entry,
+    sl,
+    tp1,
+    tp2,
+    curve,
+    bh,
+    ticker,
+    lookback,
+    strat_name,
+):
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.68, 0.32]
+    )
 
-**Data Teknikal:**
-- Skenario: {plan['Scenario']}
-- Harga: {plan['Close_T']}, View: {plan['View']}
-- RSI14: {plan['RSI14']} | MACD Hist: {plan['MACD_hist']}
-- Volume: {plan['Volume_Note']}
-- Support: {plan['Support']} | Resistance: {plan['Resistance']}
-
-**Trade Setup (Data-Driven):**
-- Entry Zone: {plan['Entry_Zone']}
-- Stop Loss: {plan['Stop_Loss']} (Risk: {plan['Risk_%']}%)
-- TP1: {plan['TP1']} (R/R: {plan['RR_Ratio_TP1']})
-- TP2: {plan['TP2']} (R/R: {plan['RR_Ratio_TP2']})
-- Win Probability: {plan['Win_Probability']} ({plan['Win_Prob_Source']})
-- Expected Value per R: {plan['Expected_Value_per_R']}
-- Kelly Full: {plan['Kelly_Full_%']}%, Quarter Kelly: {plan['Kelly_Quarter_%']}%
-- Position Assessment: {plan['Position_Note']}
-
-**Instruksi Analisis:**
-1) **Kondisi Pasar**: Jelaskan RSI/MACD/EMA & volume
-2) **Skenario Trading**: Jelaskan '{plan['Scenario']}'
-3) **Risk Management**: Analisis R/R dan Expected Value per R risked
-4) **Position Sizing**: Jelaskan Quarter Kelly ({plan['Kelly_Quarter_%']}%)
-5) **Outlook**: View {plan['View']} jangka pendek (1-2 minggu)
-6) **Disclaimer**: Singkat, risiko trading
-
-Gunakan bahasa Indonesia, professional, padat, bullet points.
-"""
-            resp = model.generate_content(prompt)
-            ai_comment = resp.text.strip()
-        except Exception as e:
-            ai_comment = f"(AI ERROR) {e}. Check API key & internet."
-    elif use_ai and (genai is None or not gemini_key):
-        ai_comment = "(AI OFF) Gemini library/API key not available."
-
-    return plan, ai_comment
-
-
-def ta_plot_trade_plan(df_raw, plan):
-    recent = _sanitize_ohlcv(df_raw).tail(120).copy()
-    fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
-            x=recent.index,
-            open=recent["Open"],
-            high=recent["High"],
-            low=recent["Low"],
-            close=recent["Close"],
+            x=data.index,
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
             name="Price",
-        )
+        ),
+        row=1,
+        col=1,
     )
-    res = plan["Resistance"]
-    sup = plan["Support"]
-    sl = plan["Stop_Loss"]
-    tp1 = plan["TP1"]
-    tp2 = plan["TP2"]
-    try:
-        e_low, e_high = [int(x.strip()) for x in plan["Entry_Zone"].split("–")]
-    except ValueError:
-        parts = plan["Entry_Zone"].replace("-", "–").split("–")
-        e_low, e_high = int(parts[0].strip()), int(parts[1].strip())
+    for name in ["ema21", "ema50", "ema200"]:
+        if name in data:
+            fig.add_trace(
+                go.Scatter(
+                    x=data.index, y=data[name], mode="lines", name=name.upper()
+                ),
+                row=1,
+                col=1,
+            )
 
-    # Ganti nama anotasi berdasarkan skenario
-    entry_level_name = "Breakout" if plan["Scenario"] == "Breakout Bullish" else "Support"
+    _hline(fig, entry, "ENTRY", 1, 1, index=data.index)
+    _hline(fig, sl, "SL", 1, 1, index=data.index)
+    _hline(fig, tp1, "TP1", 1, 1, index=data.index)
+    _hline(fig, tp2, "TP2", 1, 1, index=data.index)
 
-    for level, name in [
-        (res, "Resistance"),
-        (sup, "Support"),
-        (sl, "Stop-Loss"),
-        (tp1, "TP1"),
-        (tp2, "TP2"),
-    ]:
-        # Garis resistance dan support dibuat lebih tebal
-        is_main_level = name in ["Resistance", "Support"]
-        fig.add_hline(
-            y=level,
-            line_dash="dot" if not is_main_level else "solid",
-            line_width=1 if not is_main_level else 2,
-            annotation_text=name,
-            annotation_position="top right",
-        )
-
-    fig.add_hrect(
-        y0=e_low,
-        y1=e_high,
-        fillcolor="rgba(0,200,0,0.10)",
-        line_width=0,
-        annotation_text="ENTRY ZONE",
-        annotation_position="left",
+    fig.add_trace(
+        go.Scatter(
+            x=p_up_s.index, y=p_up_s, mode="lines", name="p(Up)-ema3"
+        ),
+        row=2,
+        col=1,
     )
+    fig.add_trace(
+        go.Scatter(
+            x=p_dn_s.index, y=p_dn_s, mode="lines", name="p(Down)-ema3"
+        ),
+        row=2,
+        col=1,
+    )
+    _hline(fig, thr_opt, f"thr={thr_opt:.2f}", 2, 1, index=p_up_s.index)
 
     fig.update_layout(
-        title=f"Trade Plan {plan['Ticker']} | Scenario: {plan['Scenario']} | View: {plan['View']}",
-        template="plotly_dark",
-        hovermode="x unified",
-        height=520,
-        yaxis_title="Harga (Rp)",
+        title=f"{ticker} • {lookback.upper()}  |  Strategy: {strat_name}",
+        xaxis_rangeslider_visible=False,
+        template="plotly_white",
+        height=700,
+        margin=dict(l=20, r=20, t=40, b=20),
     )
-    return fig
 
-
-# ==========================================================
-# Data Fetchers (cached)
-# ==========================================================
-@st.cache_data(show_spinner=False)
-def fetch_prices(ticker: str, start: str) -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        start=start,
-        end=pd.Timestamp.now() + pd.Timedelta(days=1),
-        auto_adjust=False,
-        progress=False,
-        threads=True,
+    eq = make_subplots(rows=1, cols=1)
+    eq.add_trace(
+        go.Scatter(x=curve.index, y=curve, mode="lines", name="Strategy")
     )
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def fetch_external_series(
-    start: str, include_ihsg: bool, include_vix: bool
-) -> pd.DataFrame:
-    tickers = []
-    names = []
-    if include_ihsg:
-        tickers.append("^JKSE")
-        names.append("close_jkse")
-    if include_vix:
-        tickers.append("^VIX")
-        names.append("close_vix")
-
-    if not tickers:
-        return pd.DataFrame()
-
-    ext_raw = yf.download(
-        tickers,
-        start=start,
-        end=pd.Timestamp.now() + pd.Timedelta(days=1),
-        auto_adjust=False,
-        progress=False,
+    eq.add_trace(
+        go.Scatter(x=bh.index, y=bh, mode="lines", name="Buy&Hold")
     )
-    if "Close" in ext_raw.columns:
-        ext = ext_raw["Close"]
+    eq.update_layout(
+        title="Equity Curve (log scale)",
+        yaxis_type="log",
+        template="plotly_white",
+        height=400,
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+
+    return fig, eq
+
+
+def run_full_pipeline(ticker: str, use_optuna: bool = True):
+    # 1) Fetch + feature
+    raw = fetch_ticker_data(ticker, LOOKBACK)
+    feat = add_features(raw)
+
+    # 2) News + sentiment
+    news_df = fetch_marketaux_news_df(ticker, limit=40)
+    sent = analyze_news_with_gemini(news_df)
+    feat.index = pd.to_datetime(feat.index)
+    sent.index = pd.to_datetime(sent.index)
+
+    sent = sent.reindex(feat.index, method="ffill").fillna({"sent_score": 0.0})
+    feat2 = feat.join(sent, how="left")
+    feat2["sent_score_ma3"] = (
+        feat2["sent_score"].rolling(3, min_periods=1).mean()
+    )
+    feat2["sent_score_ema7"] = feat2["sent_score"].ewm(
+        span=7, adjust=False
+    ).mean()
+
+    # 3) Labels
+    if LABEL_METHOD == "fixed":
+        y_series = make_labels_fixed(feat2, HORIZON, UP_TH, DOWN_TH)
     else:
-        ext = ext_raw.copy()
-    if isinstance(ext, pd.Series):
-        ext = ext.to_frame()
-    # Keep only tickers in same order
-    cols = []
-    for t in tickers:
-        if t in ext.columns:
-            cols.append(t)
-        elif (t,) in ext.columns:  # edge MultiIndex collapsed
-            cols.append((t,))
-    ext = ext[cols]
-    ext.columns = names
-    ext = ext.ffill()
-    return ext
-
-
-# ==========================================================
-# Runners per ticker
-# ==========================================================
-def run_ml_for_ticker(
-    ticker: str,
-    df_capital: pd.DataFrame,
-    df_ext: pd.DataFrame,
-    n_trials: int,
-    embargo: int,
-    n_splits: int,
-):
-    df_lower = df_capital[["Open", "High", "Low", "Close", "Volume"]].copy()
-    df_lower.columns = ["open", "high", "low", "close", "volume"]
-    df_merged_std = df_lower.join(df_ext, how="left").ffill()
-
-    X, y, df_for_pred = make_features_ml(df_merged_std)
-    best_params, best_thr, best_wr, splits = tune_and_backtest_ml(
-        X, y, embargo=embargo, n_splits=n_splits, n_trials=n_trials
-    )
-    metrics, prediction, df_bt, fig, fig_importance, feature_importance = train_final_and_report_ml(
-        X, y, df_for_pred, best_params, best_thr, splits, ticker
-    )
-    return metrics, prediction, df_bt, fig, fig_importance, feature_importance, best_wr
-
-
-def run_ta_for_ticker(
-    ticker: str, df_capital: pd.DataFrame, use_ai: bool, gemini_key: str, ml_winrate=None
-):
-    plan, ai_comment = ta_generate_trade_plan(
-        df_capital, ticker=ticker, use_ai=use_ai, gemini_key=gemini_key, ml_winrate=ml_winrate
-    )
-    fig = ta_plot_trade_plan(df_capital, plan)
-    return plan, ai_comment, fig
-
-
-# ==========================================================
-# =============== UI ==================
-# ==========================================================
-st.title("📊 Professional Stock Analyzer v11")
-st.markdown("*Enterprise-grade Stock Analysis with ML, TA & Risk Management*")
-st.caption("🏆 Industry Best Practices: Sharpe Ratio | Max Drawdown | Kelly Criterion | R/R Analysis")
-
-with st.sidebar:
-    st.header("⚙️ Pengaturan")
-    
-    # Input Ticker
-    with st.expander("📊 **Ticker & Data**", expanded=True):
-        tickers_input = st.text_input(
-            "Ticker (pisah spasi/koma)",
-            value="BBCA, BBRI, BMRI",
-            help="Contoh: BBCA, BBRI, BREN",
+        y_series = make_labels_triple_barrier(
+            feat2, HORIZON, TRIPLE_PT, TRIPLE_SL
         )
-        auto_append_jk = st.checkbox("Auto-append .JK", value=True)
-        start_date = st.date_input(
-            "Start Date", value=pd.to_datetime("2020-01-01")
-        ).strftime("%Y-%m-%d")
 
-    # ML Settings
-    with st.expander("🤖 **Machine Learning**", expanded=False):
-        run_ml = st.checkbox("Aktifkan ML Quant", value=True)
-        if run_ml:
-            include_ihsg = st.checkbox("Fitur IHSG (^JKSE)", value=True)
-            include_vix = st.checkbox("Fitur VIX (^VIX)", value=False)
-            n_trials = st.slider("Optuna Trials", 5, 60, 20, step=5, 
-                                help="Lebih sedikit = lebih cepat, tapi kurang optimal")
-            n_splits = st.slider("TimeSeries Splits", 3, 10, 4)
-            embargo = st.slider("Embargo (bar)", 0, 10, 5)
+    data = pd.concat([feat2, y_series], axis=1).dropna()
 
-    # TA Settings
-    with st.expander("📈 **Technical Analysis**", expanded=False):
-        run_ta = st.checkbox("Aktifkan TA + Trade Plan", value=True)
-        if run_ta:
-            use_ai = st.checkbox("Komentar AI Gemini", value=False)
-            if use_ai:
-                gemini_key = get_gemini_api_key()
-                if gemini_key:
-                    st.success("✅ API Key terdeteksi")
-                else:
-                    st.warning("⚠️ API Key tidak ditemukan")
-            else:
-                gemini_key = ""
-
-    st.markdown("---")
-    run_btn = st.button("🚀 MULAI ANALISIS", type="primary", use_container_width=True)
-    
-    # Info sidebar
-    st.markdown("---")
-    st.caption("💡 **Tips:**")
-    st.caption("• Kurangi Trials untuk kecepatan")
-    st.caption("• Start Date 2020+ untuk performa optimal")
-    st.caption("• Aktifkan AI untuk insight lebih dalam")
-
-if run_btn:
-    raw_tokens = [
-        t.strip().upper() for t in tickers_input.replace(",", " ").split() if t.strip()
+    CAND_FEATS = [
+        "ret1",
+        "ret2",
+        "ret5",
+        "ret10",
+        "logret1",
+        "rv5",
+        "rv20",
+        "rv60",
+        "vol_z",
+        "vwap_dist",
+        "rsi14",
+        "stoch_k",
+        "stoch_d",
+        "macd",
+        "macd_hist",
+        "macd_signal",
+        "bbl",
+        "bbm",
+        "bbu",
+        "bbb",
+        "bbp",
+        "mfi14",
+        "obv",
+        "adx14",
+        "atr14",
+        "ema8",
+        "ema21",
+        "ema50",
+        "ema200",
+        "ema8_slope",
+        "ema21_slope",
+        "ema50_slope",
+        "ema200_slope",
+        "ema8_gap",
+        "ema21_gap",
+        "ema50_gap",
+        "ema200_gap",
+        "cci20",
+        "willr14",
+        "cmf20",
+        "ppoh",
+        "ppo",
+        "ppos",
+        "skew20",
+        "kurt20",
+        "dow",
+        "dom",
+        "mon",
+        "is_month_end",
+        "sent_score",
+        "sent_score_ma3",
+        "sent_score_ema7",
     ]
-    tickers: List[str] = []
-    for t in raw_tokens:
-        if auto_append_jk and not t.endswith(".JK"):
-            tickers.append(f"{t}.JK")
-        else:
-            tickers.append(t)
+    FEATS = [c for c in CAND_FEATS if c in data.columns]
+    X_all = data[FEATS].astype(float).values
+    y_all = data[y_series.name].astype(int).values
+    idx_all = data.index
 
-    # Summary cards at top
-    col_info1, col_info2, col_info3 = st.columns(3)
-    with col_info1:
-        st.metric("📊 Total Saham", len(tickers))
-    with col_info2:
-        st.metric("📅 Periode Data", f"{start_date} - Sekarang")
-    with col_info3:
-        status = []
-        if run_ml:
-            status.append("ML")
-        if run_ta:
-            status.append("TA")
-        st.metric("🔧 Mode Analisis", " + ".join(status) if status else "Tidak ada")
+    # Default params
+    best_lgb_params = {
+        "n_estimators": 800,
+        "learning_rate": 0.02,
+        "num_leaves": 63,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
+        "min_child_samples": 18,
+        "reg_lambda": 1.0,
+    }
+    best_xgb_params = {
+        "eta": 0.03,
+        "max_depth": 6,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
+        "lambda": 1.0,
+        "num_boost_round": 600,
+    }
 
-    st.markdown("---")
+    # 4) Optuna (ringan)
+    if use_optuna and _USE_OPTUNA and len(X_all) > 400:
+        ts_small = TimeSeriesSplit(n_splits=3)
 
-    # External series (once)
-    df_ext = pd.DataFrame()
-    if run_ml and (include_ihsg or include_vix):
-        with st.spinner("📥 Mengunduh data eksternal (IHSG/VIX)..."):
-            try:
-                df_ext = fetch_external_series(
-                    start=start_date, include_ihsg=include_ihsg, include_vix=include_vix
+        def obj_lgb(trial):
+            params = {
+                "objective": "multiclass",
+                "num_class": 3,
+                "learning_rate": trial.suggest_float("lr", 0.005, 0.05, log=True),
+                "num_leaves": trial.suggest_int("leaves", 31, 255),
+                "subsample": trial.suggest_float("sub", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("col", 0.6, 1.0),
+                "min_child_samples": trial.suggest_int("mcs", 10, 60),
+                "reg_lambda": trial.suggest_float("l2", 0.0, 3.0),
+                "n_estimators": trial.suggest_int("nest", 400, 1200),
+                "random_state": SEED,
+                "n_jobs": -1,
+                "verbose": -1,
+            }
+            losses = []
+            for tr, te in ts_small.split(X_all):
+                Xtr, Xte = X_all[tr], X_all[te]
+                ytr, yte = y_all[tr], y_all[te]
+                lgbm = lgb.LGBMClassifier(**params)
+                lgbm.fit(
+                    Xtr,
+                    ytr,
+                    eval_set=[(Xte, yte)],
+                    eval_metric="multi_logloss",
+                    callbacks=[lgb.early_stopping(100, verbose=False)],
                 )
-                st.success("✅ Data eksternal berhasil diunduh")
-            except Exception as e:
-                st.warning(
-                    f"⚠️ Gagal mengunduh data eksternal: {e}. ML jalan tanpa konteks eksternal."
+                p = lgbm.predict_proba(Xte)
+                losses.append(log_loss(yte, p, labels=[0, 1, 2]))
+            return float(np.mean(losses))
+
+        def obj_xgb(trial):
+            params = {
+                "objective": "multi:softprob",
+                "num_class": 3,
+                "eval_metric": "mlogloss",
+                "eta": trial.suggest_float("eta", 0.01, 0.08, log=True),
+                "max_depth": trial.suggest_int("depth", 3, 9),
+                "subsample": trial.suggest_float("sub", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("col", 0.6, 1.0),
+                "lambda": trial.suggest_float("l2", 0.0, 3.0),
+                "num_boost_round": trial.suggest_int(
+                    "nbr", 300, 1200
+                ),
+            }
+            losses = []
+            for tr, te in ts_small.split(X_all):
+                dtr = xgb.DMatrix(X_all[tr], label=y_all[tr])
+                dte = xgb.DMatrix(X_all[te], label=y_all[te])
+                model = xgb.train(
+                    params,
+                    dtr,
+                    params["num_boost_round"],
+                    evals=[(dte, "val")],
+                    early_stopping_rounds=100,
+                    verbose_eval=False,
                 )
-                df_ext = pd.DataFrame()
+                p = model.predict(
+                    dte,
+                    iteration_range=(0, model.best_iteration + 1),
+                )
+                losses.append(log_loss(y_all[te], p, labels=[0, 1, 2]))
+            return float(np.mean(losses))
 
-    ml_predictions: List[Dict[str, Any]] = []
-    ml_holdout_metrics: List[Dict[str, Any]] = []
-    ticker_ml_winrates: Dict[str, float] = {}  # Store ML winrates for TA
+        study1 = optuna.create_study(
+            direction="minimize", pruner=MedianPruner()
+        )
+        study1.optimize(
+            obj_lgb, n_trials=min(OPTUNA_TRIALS, 30), show_progress_bar=False
+        )
+        bp = study1.best_params
+        best_lgb_params.update(
+            {
+                "learning_rate": bp["lr"],
+                "num_leaves": bp["leaves"],
+                "subsample": bp["sub"],
+                "colsample_bytree": bp["col"],
+                "min_child_samples": bp["mcs"],
+                "reg_lambda": bp["l2"],
+                "n_estimators": bp["nest"],
+            }
+        )
 
-    # Progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for idx, t in enumerate(tickers):
-        progress_bar.progress((idx) / len(tickers))
-        status_text.text(f"Memproses {idx + 1}/{len(tickers)}: {t}")
-        
-        st.markdown(f"## 📌 {t}")
-        
-        with st.spinner(f"📊 Mengunduh data harga {t}..."):
-            df_raw = fetch_prices(t, start=start_date)
-            if df_raw.empty:
-                st.error(f"❌ Data yfinance kosong untuk {t}. Skip.")
-                continue
-            df_capital = _sanitize_ohlcv(df_raw)
-            st.success(f"✅ Data {t} berhasil diunduh ({len(df_capital)} data points)")
+        study2 = optuna.create_study(
+            direction="minimize", pruner=MedianPruner()
+        )
+        study2.optimize(
+            obj_xgb, n_trials=min(OPTUNA_TRIALS, 30), show_progress_bar=False
+        )
+        bx = study2.best_params
+        best_xgb_params.update(
+            {
+                "eta": bx["eta"],
+                "max_depth": bx["depth"],
+                "subsample": bx["sub"],
+                "colsample_bytree": bx["col"],
+                "lambda": bx["l2"],
+                "num_boost_round": bx["nbr"],
+            }
+        )
 
-        # Use tabs for better mobile experience
-        if run_ml and run_ta:
-            tab1, tab2 = st.tabs(["🤖 Machine Learning", "📈 Technical Analysis"])
-        elif run_ml:
-            tab1 = st.container()
-        elif run_ta:
-            tab2 = st.container()
-        else:
-            st.warning("⚠️ Tidak ada mode analisis yang dipilih")
+    # 5) Train CV + Ensemble
+    results = []
+    proba_oos = np.full((len(y_all), 3), np.nan, dtype=float)
+    best_w = (0.45, 0.25, 0.20, 0.10)
+
+    TS = TimeSeriesSplit(n_splits=N_SPLITS)
+    for split_id, (tr, te) in enumerate(TS.split(X_all)):
+        if len(tr) <= WINDOW or len(te) == 0:
             continue
+        tr_end = tr[-1] - GAP if tr[-1] - GAP > tr[0] else tr[-1]
+        tr_idx = np.arange(tr[0], tr_end + 1)
+        if len(tr_idx) <= WINDOW:
+            continue
+        Xtr, Xte = X_all[tr_idx], X_all[te]
+        ytr, yte = y_all[tr_idx], y_all[te]
 
-        if run_ml:
-            with (tab1 if run_ta else st.container()):
-                st.markdown("### 🤖 ML Quant Analysis")
-                try:
-                    with st.spinner("🔄 Training & backtest ML..."):
-                        metrics, pred, df_bt, fig_ml, fig_importance, feature_importance, cv_wr = run_ml_for_ticker(
-                            t,
-                            df_capital,
-                            df_ext,
-                            n_trials=n_trials,
-                            embargo=embargo,
-                            n_splits=n_splits,
-                        )
-                    
-                    # Enhanced Metrics in columns
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("🎯 CV Win-Rate", f"{cv_wr:.2%}")
-                    with col2:
-                        st.metric("📊 Holdout WR", f"{metrics['winrate_holdout']:.2%}")
-                    with col3:
-                        st.metric("📈 Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-                    with col4:
-                        st.metric("📉 Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-                    
-                    col5, col6, col7, col8 = st.columns(4)
-                    with col5:
-                        st.metric("💰 Profit Factor", f"{metrics['profit_factor']:.2f}")
-                    with col6:
-                        st.metric("⚖️ Win/Loss Ratio", f"{metrics['win_loss_ratio']:.2f}")
-                    with col7:
-                        st.metric("📉 MAE", f"{metrics['mae_holdout']:.0f}")
-                    with col8:
-                        st.metric("📊 R²", f"{metrics['r2_holdout']:.3f}")
-                    
-                    st.plotly_chart(fig_ml, use_container_width=True)
-                    
-                    # Prediction with Confidence Interval
-                    st.markdown("#### 🔮 Prediksi T+1")
-                    pred_col1, pred_col2, pred_col3 = st.columns(3)
-                    with pred_col1:
-                        st.metric("Prediksi", f"Rp {pred['ML_Pred_Harga_T+1']:,}", 
-                                 delta=f"{pred['ML_Pred_Return_T+1']*100:.2f}%")
-                    with pred_col2:
-                        st.metric("Lower 95%", f"Rp {pred['ML_Pred_Lower_95']:,}")
-                    with pred_col3:
-                        st.metric("Upper 95%", f"Rp {pred['ML_Pred_Upper_95']:,}")
-                    
-                    # Feature Importance
-                    with st.expander("� Feature Importance (Top 10)"):
-                        st.plotly_chart(fig_importance, use_container_width=True)
-                        st.dataframe(feature_importance, use_container_width=True)
-                    
-                    with st.expander("�📋 Detail Prediksi (15 data terakhir)"):
-                        st.dataframe(
-                            df_bt.tail(15)[
-                                [
-                                    "Date_t",
-                                    "close_t",
-                                    "Pred_close_Tplus1",
-                                    "Actual_close_Tplus1",
-                                    "Selisih",
-                                    "ArahPred",
-                                    "ArahActual",
-                                    "Benar?",
-                                ]
-                            ],
-                            use_container_width=True,
-                        )
-                    
-                    ml_predictions.append(pred)
-                    ml_holdout_metrics.append(metrics)
-                    # Store winrate for TA to use
-                    ticker_ml_winrates[t] = metrics['winrate_holdout']
-                    
-                except Exception as e:
-                    st.error(f"❌ ML gagal untuk {t}: {e}")
+        classes, counts = np.unique(ytr, return_counts=True)
+        total = counts.sum()
+        class_weight = {
+            int(c): float(total / (len(classes) * cnt))
+            for c, cnt in zip(classes, counts)
+        }
 
-        if run_ta:
-            with (tab2 if run_ml else st.container()):
-                st.markdown("### 📈 TA + Trade Plan")
-                try:
-                    # Pass ML winrate if available
-                    ml_wr = ticker_ml_winrates.get(t, None)
-                    plan, ai_comment, fig_ta = run_ta_for_ticker(
-                        t, df_capital, use_ai=use_ai, gemini_key=gemini_key, ml_winrate=ml_wr
-                    )
-                    
-                    # Key metrics in columns
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("💰 Harga Sekarang", f"Rp {plan['Close_T']:,}")
-                    with col2:
-                        st.metric("📊 Scenario", plan['Scenario'])
-                    with col3:
-                        st.metric("🎯 View", plan['View'])
-                    with col4:
-                        st.metric("📈 RSI14", plan['RSI14'])
-                    
-                    # Risk/Reward Metrics (Data-Driven)
-                    st.markdown("#### ⚖️ Risk/Reward Analysis (Real Data)")
-                    rr_col1, rr_col2, rr_col3, rr_col4 = st.columns(4)
-                    with rr_col1:
-                        st.metric("R/R Ratio (TP1)", f"{plan['RR_Ratio_TP1']:.2f}")
-                    with rr_col2:
-                        st.metric("R/R Ratio (TP2)", f"{plan['RR_Ratio_TP2']:.2f}")
-                    with rr_col3:
-                        st.metric("Win Probability", f"{plan['Win_Probability']:.1%}",
-                                 help=f"Source: {plan['Win_Prob_Source']}")
-                    with rr_col4:
-                        st.metric("Expected Value/R", f"{plan['Expected_Value_per_R']:.2f}",
-                                 help="Expected value per R risked")
-                    
-                    # Kelly Criterion & Position Sizing
-                    st.markdown("#### 💰 Position Sizing (Kelly Criterion)")
-                    kelly_col1, kelly_col2, kelly_col3 = st.columns(3)
-                    with kelly_col1:
-                        st.metric(
-                            "Kelly Full", 
-                            f"{plan['Kelly_Full_%']}%",
-                            help="Full Kelly (theoretical max)"
-                        )
-                    with kelly_col2:
-                        st.metric(
-                            "Quarter Kelly", 
-                            f"{plan['Kelly_Quarter_%']}%",
-                            help="1/4 Kelly - Industry standard"
-                        )
-                    with kelly_col3:
-                        ev_per_r = plan['Expected_Value_per_R']
-                        if ev_per_r > 0.3:
-                            badge = "� Excellent"
-                        elif ev_per_r > 0:
-                            badge = "🟡 Positive"
-                        else:
-                            badge = "🔴 Negative"
-                        st.metric("Edge Assessment", badge)
-                    
-                    st.plotly_chart(fig_ta, use_container_width=True)
-                    
-                    # Info about probability source
-                    if ml_wr is not None:
-                        st.info(f"ℹ️ **Win Probability menggunakan ML Model**: "
-                               f"{plan['Win_Probability']:.1%} (dari holdout validation)")
-                    else:
-                        st.info(f"ℹ️ **Win Probability berdasarkan TA**: "
-                               f"{plan['Win_Probability']:.1%} (dari indikator teknikal)")
-                    
-                    with st.expander("📋 Detail Trade Plan"):
-                        st.dataframe(
-                            pd.DataFrame([plan]).T.rename(columns={0: "Value"}),
-                            use_container_width=True,
-                        )
-                    
-                    if ai_comment:
-                        st.info(f"🤖 **AI Analysis:**\n\n{ai_comment}")
-                        
-                except Exception as e:
-                    st.error(f"❌ TA gagal untuk {t}: {e}")
-        
-        st.markdown("---")
+        lgbm = lgb.LGBMClassifier(
+            objective="multiclass",
+            num_class=3,
+            random_state=SEED,
+            class_weight=class_weight,
+            n_jobs=-1,
+            **best_lgb_params,
+        )
+        lgbm.fit(
+            Xtr,
+            ytr,
+            eval_set=[(Xte, yte)],
+            eval_metric="multi_logloss",
+            callbacks=[lgb.early_stopping(120, verbose=False)],
+        )
+        p_lgb = lgbm.predict_proba(Xte)
 
-    # Complete progress
-    progress_bar.progress(1.0)
-    status_text.text("✅ Semua ticker selesai diproses!")
+        scaler = StandardScaler().fit(Xtr)
+        Ztr, Zte = scaler.transform(Xtr), scaler.transform(Xte)
+        Z_full_for_seq = np.concatenate(
+            [Ztr[-(WINDOW - 1) :], Zte], axis=0
+        )
 
-    # Summary Section
-    st.markdown("---")
-    st.markdown("# 📊 Ringkasan Hasil Analisis")
-    
-    if run_ml and ml_predictions:
-        st.markdown("## 🤖 Ringkasan ML — Prediksi T+1")
-        df_pred = pd.DataFrame(ml_predictions).set_index("Ticker")
-        fmt_pred = df_pred.copy()
-        if "ML_Close_T" in fmt_pred.columns:
-            fmt_pred["ML_Close_T"] = fmt_pred["ML_Close_T"].round(0)
-        if "ML_Pred_Harga_T+1" in fmt_pred.columns:
-            fmt_pred["ML_Pred_Harga_T+1"] = fmt_pred["ML_Pred_Harga_T+1"].round(0)
-        if "ML_Pred_Lower_95" in fmt_pred.columns:
-            fmt_pred["ML_Pred_Lower_95"] = fmt_pred["ML_Pred_Lower_95"].round(0)
-        if "ML_Pred_Upper_95" in fmt_pred.columns:
-            fmt_pred["ML_Pred_Upper_95"] = fmt_pred["ML_Pred_Upper_95"].round(0)
-        if "ML_Pred_Return_T+1" in fmt_pred.columns:
-            fmt_pred["ML_Pred_Return_T+1"] = (
-                fmt_pred["ML_Pred_Return_T+1"] * 100
-            ).round(2)
-        if "ML_Threshold_Arah" in fmt_pred.columns:
-            fmt_pred["ML_Threshold_Arah"] = (fmt_pred["ML_Threshold_Arah"] * 100).round(
-                2
+        Xs_tr, ys_tr = make_sequences(Ztr, ytr, WINDOW)
+        Xs_te = []
+        if len(Z_full_for_seq) > WINDOW:
+            for i in range(WINDOW, len(Z_full_for_seq)):
+                Xs_te.append(Z_full_for_seq[i - WINDOW : i])
+        Xs_te = np.asarray(Xs_te, np.float32)
+
+        if (
+            len(Xs_tr) == 0
+            or len(Xs_te) == 0
+            or len(Xs_te) != len(yte)
+        ):
+            p_gru = np.tile(
+                np.array([1 / 3, 1 / 3, 1 / 3]), (len(yte), 1)
             )
-        st.dataframe(fmt_pred, use_container_width=True)
-        
-        # Download button for ML predictions
-        csv_pred = fmt_pred.to_csv().encode('utf-8')
-        st.download_button(
-            label="📥 Download Prediksi ML (CSV)",
-            data=csv_pred,
-            file_name=f"ml_predictions_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
+            p_trf = p_gru.copy()
+        else:
+            tf.keras.backend.clear_session()
+            gru = keras.Sequential(
+                [
+                    layers.Input(shape=(WINDOW, Ztr.shape[1])),
+                    layers.GRU(64, return_sequences=True),
+                    layers.Dropout(0.25),
+                    layers.GRU(48),
+                    layers.Dropout(0.25),
+                    layers.Dense(3, activation="softmax"),
+                ]
+            )
+            gru.compile(
+                optimizer=keras.optimizers.Adam(1e-3),
+                loss="sparse_categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+            gru.fit(
+                Xs_tr,
+                ys_tr,
+                epochs=30,
+                batch_size=64,
+                validation_split=0.1,
+                callbacks=[
+                    keras.callbacks.EarlyStopping(
+                        "val_loss", patience=5, restore_best_weights=True
+                    )
+                ],
+                verbose=0,
+            )
+            p_gru = gru.predict(Xs_te, verbose=0)
+
+            inp = layers.Input(shape=(WINDOW, Ztr.shape[1]))
+            x = layers.Dense(64)(inp)
+            att = layers.MultiHeadAttention(num_heads=4, key_dim=64)(x, x)
+            x = layers.LayerNormalization(epsilon=1e-6)(x + att)
+            ff = keras.Sequential(
+                [
+                    layers.Dense(128, activation="gelu"),
+                    layers.Dense(64),
+                ]
+            )(x)
+            x = layers.LayerNormalization(epsilon=1e-6)(x + ff)
+            x = layers.GlobalAveragePooling1D()(x)
+            x = layers.Dropout(0.3)(x)
+            out = layers.Dense(3, activation="softmax")(x)
+            trf = keras.Model(inp, out)
+            trf.compile(
+                optimizer=keras.optimizers.Adam(1e-3),
+                loss="sparse_categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+            trf.fit(
+                Xs_tr,
+                ys_tr,
+                epochs=20,
+                batch_size=64,
+                validation_split=0.1,
+                callbacks=[
+                    keras.callbacks.EarlyStopping(
+                        "val_loss", patience=4, restore_best_weights=True
+                    )
+                ],
+                verbose=0,
+            )
+            p_trf = trf.predict(Xs_te, verbose=0)
+
+        dtrain = xgb.DMatrix(Xtr, label=ytr)
+        dtest = xgb.DMatrix(Xte, label=yte)
+        params = {
+            "objective": "multi:softprob",
+            "num_class": 3,
+            "eval_metric": "mlogloss",
+            "eta": best_xgb_params["eta"],
+            "max_depth": best_xgb_params["max_depth"],
+            "subsample": best_xgb_params["subsample"],
+            "colsample_bytree": best_xgb_params["colsample_bytree"],
+            "lambda": best_xgb_params["lambda"],
+        }
+
+        xgbm = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=best_xgb_params["num_boost_round"],
+            evals=[(dtest, "val")],
+            early_stopping_rounds=100,
+            verbose_eval=False,
+        )
+        p_xgb = xgbm.predict(
+            dtest, iteration_range=(0, xgbm.best_iteration + 1)
         )
 
-        st.markdown("## 🎯 Ringkasan ML — Metrik Performa")
-        df_metrics = pd.DataFrame(ml_holdout_metrics).set_index("Ticker")
-        fmt_met = df_metrics.copy()
-        if "winrate_holdout" in fmt_met.columns:
-            fmt_met["winrate_holdout"] = (fmt_met["winrate_holdout"] * 100).round(2)
-        if "mae_holdout" in fmt_met.columns:
-            fmt_met["mae_holdout"] = fmt_met["mae_holdout"].round(0)
-        if "r2_holdout" in fmt_met.columns:
-            fmt_met["r2_holdout"] = fmt_met["r2_holdout"].round(3)
-        if "sharpe_ratio" in fmt_met.columns:
-            fmt_met["sharpe_ratio"] = fmt_met["sharpe_ratio"].round(2)
-        if "max_drawdown" in fmt_met.columns:
-            fmt_met["max_drawdown"] = (fmt_met["max_drawdown"] * 100).round(2)
-        if "win_loss_ratio" in fmt_met.columns:
-            fmt_met["win_loss_ratio"] = fmt_met["win_loss_ratio"].round(2)
-        if "profit_factor" in fmt_met.columns:
-            fmt_met["profit_factor"] = fmt_met["profit_factor"].round(2)
-        
-        st.dataframe(fmt_met, use_container_width=True)
-        
-        # Interpretation guide
-        with st.expander("📖 Panduan Interpretasi Metrik"):
-            st.markdown("""
-            **Win Rate**: Persentase prediksi arah yang benar (>55% = bagus)
-            
-            **Sharpe Ratio**: Risk-adjusted return
-            - < 1: Poor
-            - 1-2: Good
-            - > 2: Excellent
-            
-            **Max Drawdown**: Kerugian maksimal dari peak (-20% = moderate risk)
-            
-            **Win/Loss Ratio**: Rata-rata profit vs loss (>1.5 = bagus)
-            
-            **Profit Factor**: Total profit / total loss (>1.5 = profitable)
-            
-            **R²**: Kualitas fit model (>0.3 = decent untuk harga saham)
-            
-            **Expected Value per R**: Profit/loss yang diharapkan per 1R risked
-            - > 0.5: Excellent edge
-            - 0.2-0.5: Good edge
-            - 0-0.2: Marginal edge
-            - < 0: Skip trade
-            
-            **Kelly Criterion**:
-            - Full Kelly: Theoretical maximum (terlalu agresif)
-            - Quarter Kelly (1/4): Industry standard untuk risk management real
-            - Basis: Win-rate dari ML model holdout (data-driven, bukan asumsi)
-            """)
-        
-        # Download button for metrics
-        csv_metrics = fmt_met.to_csv().encode('utf-8')
-        st.download_button(
-            label="📥 Download Metrik ML (CSV)",
-            data=csv_metrics,
-            file_name=f"ml_metrics_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
+        p_lgb_cal, _ = temp_scale_probs(p_lgb)
+        p_gru_cal, _ = temp_scale_probs(p_gru)
+        p_trf_cal, _ = temp_scale_probs(p_trf)
+        p_xgb_cal, _ = temp_scale_probs(p_xgb)
+
+        w = weight_search(
+            [p_lgb_cal, p_gru_cal, p_trf_cal, p_xgb_cal], yte
+        )
+        if w:
+            best_w = w
+        p_ens = (
+            best_w[0] * p_lgb_cal
+            + best_w[1] * p_gru_cal
+            + best_w[2] * p_trf_cal
+            + best_w[3] * p_xgb_cal
         )
 
-else:
-    # Welcome message
-    st.info("👈 **Cara Penggunaan:**\n\n1. Masukkan ticker saham di sidebar\n2. Pilih mode analisis (ML/TA atau keduanya)\n3. Atur parameter sesuai kebutuhan\n4. Klik tombol **MULAI ANALISIS**")
-    
-    st.markdown("---")
-    st.markdown("### 🎯 Fitur Utama")
-    
-    col1, col2 = st.columns(2)
+        if p_ens.shape[0] == len(te):
+            proba_oos[te] = p_ens
+            y_pred = p_ens.argmax(axis=1)
+            results.append(
+                (
+                    accuracy_score(yte, y_pred),
+                    f1_score(yte, y_pred, average="macro"),
+                )
+            )
+        else:
+            p_gbdt_ens = 0.6 * p_lgb_cal + 0.4 * p_xgb_cal
+            if p_gbdt_ens.shape[0] == len(te):
+                proba_oos[te] = p_gbdt_ens
+                y_pred = p_gbdt_ens.argmax(axis=1)
+                results.append(
+                    (
+                        accuracy_score(yte, y_pred),
+                        f1_score(yte, y_pred, average="macro"),
+                    )
+                )
+
+    # CV metrics
+    accs = [a for a, _ in results if not pd.isna(a)]
+    f1s = [b for _, b in results if not pd.isna(b)]
+    cv_acc = float(np.mean(accs)) if len(accs) else None
+    cv_f1 = float(np.mean(f1s)) if len(f1s) else None
+
+    idx_all = pd.to_datetime(idx_all)
+    data.index = pd.to_datetime(data.index)
+
+    p_up = pd.Series(proba_oos[:, 2], index=idx_all)
+    p_dn = pd.Series(proba_oos[:, 0], index=idx_all)
+    p_up_s = p_up.ewm(span=3, adjust=False).mean()
+    p_dn_s = p_dn.ewm(span=3, adjust=False).mean()
+
+    ret_daily = data["Close"].pct_change().reindex(index=idx_all)
+
+    thr_opt = 0.58
+    mg_opt = 0.06
+    if use_optuna and _USE_OPTUNA and len(idx_all) > 200:
+        def obj_thr(trial):
+            thr = trial.suggest_float("thr", 0.50, 0.72)
+            mg = trial.suggest_float("mg", 0.02, 0.15)
+            sig = ((p_up_s > thr) & ((p_up_s - p_dn_s) > mg)).astype(int)
+            sig = sig.shift(1).fillna(0)
+            strat = sig * (
+                ret_daily - TX_COST * sig.diff().abs().fillna(0)
+            )
+            if strat.std(ddof=1) == 0:
+                return 1e6
+            sr = (strat.mean() / strat.std(ddof=1)) * np.sqrt(252)
+            return -float(sr)
+
+        st_thr = optuna.create_study(direction="minimize")
+        st_thr.optimize(
+            obj_thr, n_trials=OPTUNA_TRIALS, show_progress_bar=False
+        )
+        thr_opt = float(st_thr.best_params["thr"])
+        mg_opt = float(st_thr.best_params["mg"])
+    else:
+        best_sr = -1e9
+        for thr in np.linspace(0.5, 0.72, 12):
+            for mg in np.linspace(0.02, 0.15, 14):
+                sig = ((p_up_s > thr) & ((p_up_s - p_dn_s) > mg)).astype(
+                    int
+                )
+                sig = sig.shift(1).fillna(0)
+                strat = sig * (
+                    ret_daily - TX_COST * sig.diff().abs().fillna(0)
+                )
+                if strat.std(ddof=1) > 0:
+                    sr = (
+                        strat.mean() / strat.std(ddof=1)
+                    ) * np.sqrt(252)
+                    if sr > best_sr:
+                        best_sr = sr
+                        thr_opt = thr
+                        mg_opt = mg
+
+    signal = (
+        (p_up_s > thr_opt) & ((p_up_s - p_dn_s) > mg_opt)
+    ).astype(int)
+    signal = (
+        signal.reindex(data.index).fillna(0).shift(1)
+    )
+    ret = data["Close"].pct_change()
+    strat_ret = (signal * (ret - TX_COST * signal.diff().abs().fillna(0))).fillna(0)
+    curve = (1 + strat_ret).cumprod()
+    bh = (1 + ret.fillna(0)).cumprod()
+
+    if not curve.empty and curve.iloc[-1] != 0 and not pd.isna(curve.iloc[-1]):
+        cagr = curve.iloc[-1] ** (252 / len(curve)) - 1
+        sr = (
+            (strat_ret.mean() / strat_ret.std(ddof=1)) * np.sqrt(252)
+            if strat_ret.std(ddof=1) > 0
+            else np.nan
+        )
+    else:
+        cagr, sr = None, None
+
+    mask = ~np.isnan(proba_oos).any(axis=1)
+    yhat = None
+    oos_df = None
+    cls_report = None
+    cm = None
+
+    if mask.sum() > 0:
+        yhat = proba_oos[mask].argmax(axis=1)
+        cls_report = classification_report(
+            y_all[mask],
+            yhat,
+            target_names=[IDX2LAB[i] for i in range(3)],
+            zero_division=0,
+        )
+        cm = confusion_matrix(y_all[mask], yhat)
+
+        oos_df = pd.DataFrame(
+            {
+                "Date": idx_all[mask],
+                "Close": data.loc[idx_all[mask], "Close"].values,
+                "Actual": y_all[mask],
+                "Predicted": yhat,
+                "Prob_Down": proba_oos[mask, 0],
+                "Prob_Flat": proba_oos[mask, 1],
+                "Prob_Up": proba_oos[mask, 2],
+            }
+        )
+        oos_df["Actual"] = oos_df["Actual"].map(IDX2LAB)
+        oos_df["Predicted"] = oos_df["Predicted"].map(IDX2LAB)
+        oos_df["Date"] = oos_df["Date"].dt.strftime("%Y-%m-%d")
+
+    # Trading plan levels
+    ema21 = data["ema21"]
+    ema50 = data["ema50"]
+    ema200 = data["ema200"]
+    atr = data["atr14"]
+
+    last_close = float(data["Close"].iloc[-1])
+    last_date = str(data.index[-1].date())
+    atr_now = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else float(
+        data["Close"].pct_change()
+        .rolling(14)
+        .std()
+        .iloc[-1]
+        * data["Close"].iloc[-1]
+    )
+    res_20 = (
+        float(data["High"].rolling(20).max().iloc[-2])
+        if len(data) >= 21
+        else float(data["High"].max())
+    )
+    sup_20 = (
+        float(data["Low"].rolling(20).min().iloc[-2])
+        if len(data) >= 21
+        else float(data["Low"].min())
+    )
+
+    trend_up = (last_close > ema50.iloc[-1]) and (
+        ema50.iloc[-1] > ema200.iloc[-1]
+    )
+    prob_up = float(p_up_s.fillna(0.0).iloc[-1])
+    prob_down = float(p_dn_s.fillna(0.0).iloc[-1])
+    prob_flat = max(0.0, 1.0 - prob_up - prob_down)
+
+    if trend_up and prob_up > 0.58:
+        strat_name = "Buy on Breakout"
+        entry = res_20 + 0.1 * atr_now
+        sl = entry - 1.2 * atr_now
+        tp1 = entry + 1.5 * atr_now
+        tp2 = entry + 2.5 * atr_now
+    else:
+        strat_name = "Buy Pullback to EMA21"
+        entry = float(ema21.iloc[-1])
+        sl = entry - 1.5 * atr_now
+        tp1 = entry + 1.2 * atr_now
+        tp2 = entry + 2.0 * atr_now
+
+    sl = min(sl, entry * 0.995)
+
+    plan_text = (
+        f"Strategy: {strat_name}\n"
+        f"Entry: {entry:.2f}\n"
+        f"Stop Loss: {sl:.2f}\n"
+        f"TP1: {tp1:.2f}\n"
+        f"TP2: {tp2:.2f}\n"
+        f"(ProbUp={prob_up:.2f}, Close={last_close:.2f}, ATR={atr_now:.2f})"
+    )
+
+    if _HAS_GEMINI:
+        try:
+            model = genai.GenerativeModel("gemini-2.5-flash-preview-09-2025")
+            prompt = (
+                f"Buat trading plan singkat bahasa Indonesia untuk {ticker} berdasarkan data berikut. "
+                f"Tanggal terakhir {last_date}. ProbUp={prob_up:.2f}. Close={last_close:.2f}. ATR14={atr_now:.2f}. "
+                f"Resistance20={res_20:.2f}, Support20={sup_20:.2f}. "
+                f"EMA21={float(ema21.iloc[-1]):.2f}, "
+                f"EMA50={float(ema50.iloc[-1]):.2f}, EMA200={float(ema200.iloc[-1]):.2f}. "
+                f"Rekomendasikan gaya: '{strat_name}'. Berikan level detail: Entry, Stop Loss, Take Profit 1 & 2, "
+                f"logika singkat, dan manajemen risiko. Maks 6 kalimat."
+            )
+            resp = model.generate_content(prompt)
+            plan_text = resp.text.strip()
+        except Exception:
+            pass
+
+    pred_df = pd.DataFrame(
+        {
+            "Tanggal Prediksi": [last_date],
+            "Tipe Strategi": [strat_name],
+            "Prob. Naik": [f"{prob_up:.2%}"],
+            "Prob. Datar": [f"{prob_flat:.2%}"],
+            "Prob. Turun": [f"{prob_down:.2%}"],
+            "Target Entry": [f"{entry:.2f}"],
+            "Target SL": [f"{sl:.2f}"],
+            "Target TP1": [f"{tp1:.2f}"],
+            "Target TP2": [f"{tp2:.2f}"],
+        }
+    )
+
+    outputs = {
+        "ticker": ticker,
+        "lookback": LOOKBACK,
+        "cv_acc": cv_acc,
+        "cv_f1": cv_f1,
+        "thr_opt": thr_opt,
+        "margin_opt": mg_opt,
+        "last_close": last_close,
+        "atr14": atr_now,
+        "plan": plan_text,
+        "entry": entry,
+        "stop_loss": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "cagr": cagr,
+        "sharpe": sr,
+        "oos_df": oos_df,
+        "p_up_s": p_up_s,
+        "p_dn_s": p_dn_s,
+        "curve": curve,
+        "bh": bh,
+        "data": data,
+        "prob_up": prob_up,
+        "prob_down": prob_down,
+        "prob_flat": prob_flat,
+        "cls_report": cls_report,
+        "cm": cm,
+        "strat_name": strat_name,
+    }
+
+    return outputs
+
+
+# =====================
+# STREAMLIT APP
+# =====================
+def main():
+    st.set_page_config(
+        page_title="ML Trading + Gemini Plan",
+        page_icon="📈",
+        layout="wide",
+    )
+
+    st.title("📈 ML Trading (3Y) + Optuna + Gemini Plan")
+    st.caption("by Darrell + ChatGPT — versi Streamlit (responsive)")
+
+    with st.sidebar:
+        st.subheader("⚙️ Pengaturan")
+        user_ticker = st.text_input(
+            "Ticker (BBCA, BBCA.JK, ^JKSE, dll)",
+            value="^JKSE",
+        ).strip()
+
+        # normalisasi .JK
+        if user_ticker and user_ticker.isalpha() and not user_ticker.endswith(".JK") and not user_ticker.startswith("^"):
+            ticker = user_ticker + ".JK"
+        else:
+            ticker = user_ticker or "^JKSE"
+
+        use_optuna = st.checkbox(
+            "Aktifkan Optuna (lebih lambat tapi lebih optimal)",
+            value=True,
+        )
+
+        st.markdown("---")
+        st.markdown("**API Keys**")
+        st.write(
+            "- `GEMINI_API_KEY`: diperlukan untuk trading plan AI & sentimen berita.\n"
+            "- `MARKETAUX_API_KEY`: untuk berita pasar (opsional)."
+        )
+
+        run_btn = st.button("🚀 Jalankan Analisis", type="primary")
+
+    if not run_btn:
+        st.info("Masukkan ticker lalu klik **🚀 Jalankan Analisis**.")
+        return
+
+    try:
+        with st.spinner("Mengambil data & menjalankan pipeline ML (harap tunggu)..."):
+            outputs = run_full_pipeline(ticker, use_optuna=use_optuna)
+    except Exception as e:
+        st.error(f"Gagal menjalankan pipeline: {e}")
+        return
+
+    data = outputs["data"]
+    if data is None or data.empty:
+        st.warning("Data kosong setelah pemrosesan. Coba ticker lain.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.markdown("""
-        **🤖 Machine Learning:**
-        - Prediksi harga T+1 dengan confidence interval
-        - Win-rate & Direction Accuracy
-        - **Risk Metrics:**
-          - Sharpe Ratio (risk-adjusted return)
-          - Max Drawdown (kerugian maksimal)
-          - Win/Loss Ratio & Profit Factor
-        - **Feature Importance Analysis**
-        - Walk-forward validation
-        - Hyperparameter tuning otomatis (Optuna)
-        """)
-    
+        st.metric("Ticker", outputs["ticker"])
+        st.metric("Lookback", outputs["lookback"])
     with col2:
-        st.markdown("""
-        **📈 Technical Analysis:**
-        - Trade plan otomatis (dynamic)
-        - Support & Resistance detection
-        - **Smart Scenario:**
-          - Breakout (jika dekat resistance)
-          - Swing (jika dekat support)
-        - **Risk Management:**
-          - Risk/Reward Ratio calculation
-          - Position sizing recommendation (Kelly)
-          - Expected return estimation
-        - AI-powered insights (Gemini)
-        """)
-    
-    st.markdown("---")
-    st.markdown("### 📊 Industry Best Practices")
-    
-    st.markdown("""
-    Aplikasi ini menggunakan **best practices** dari industri finance & quant trading:
-    
-    1. **Walk-Forward Validation** - Menghindari look-ahead bias
-    2. **Embargo Period** - Menghindari data leakage
-    3. **Risk-Adjusted Metrics** - Sharpe Ratio, Max Drawdown
-    4. **Data-Driven Kelly Criterion** - Position sizing berdasarkan ML win-rate actual
-    5. **Fractional Kelly (1/4)** - Industry standard risk management
-    6. **Confidence Intervals** - Estimasi range prediksi (95% CI)
-    7. **Feature Importance** - Transparency & interpretability
-    8. **Dynamic Trade Plans** - Adaptif terhadap kondisi pasar
-    9. **Expected Value per R** - Probabilistic risk/reward analysis
-    """)
-    
-    st.markdown("---")
-    st.markdown("### 💡 Tips Penggunaan")
-    
-    tip_col1, tip_col2 = st.columns(2)
-    with tip_col1:
-        st.markdown("""
-        **Untuk Performa Optimal:**
-        - Start date: 2020+ (lebih cepat)
-        - Optuna Trials: 20-30 (balance speed-accuracy)
-        - Splits: 4-5 (sufficient validation)
-        """)
-    with tip_col2:
-        st.markdown("""
-        **Interpretasi Hasil:**
-        - Sharpe > 1 = good, >2 = excellent
-        - Win Rate > 55% = profitable edge
-        - R/R Ratio > 2 = favorable risk/reward
-        """)
-    
-    st.markdown("---")
-    st.markdown("### 📊 Contoh Ticker IDX")
-    st.code("BBCA, BBRI, BMRI, TLKM, ASII, UNVR, GOTO, BREN")
-    
-    st.markdown("---")
-    st.caption("Built with ❤️ using Streamlit, LightGBM, Optuna & Gemini AI | v11.0 - Enhanced Edition")
+        st.metric(
+            "CV Accuracy",
+            f"{outputs['cv_acc']:.3f}" if outputs["cv_acc"] is not None else "N/A",
+        )
+        st.metric(
+            "CV F1",
+            f"{outputs['cv_f1']:.3f}" if outputs["cv_f1"] is not None else "N/A",
+        )
+    with col3:
+        st.metric(
+            "CAGR (net)",
+            f"{outputs['cagr']*100:.2f}%" if outputs["cagr"] is not None else "N/A",
+        )
+        st.metric(
+            "Sharpe Ratio",
+            f"{outputs['sharpe']:.2f}" if outputs["sharpe"] is not None else "N/A",
+        )
+    with col4:
+        st.metric("Threshold", f"{outputs['thr_opt']:.2f}")
+        st.metric("Margin Diff", f"{outputs['margin_opt']:.2f}")
+
+    st.markdown("### 🧠 Trading Plan (AI)")
+    st.write(outputs["plan"])
+
+    tabs = st.tabs(
+        [
+            "📊 Chart & Equity Curve",
+            "📋 Backtest Detail",
+            "🎯 Prediksi T+1",
+            "📑 Classification Report",
+        ]
+    )
+
+    with tabs[0]:
+        fig1, fig2 = make_dashboard(
+            data=data,
+            p_up_s=outputs["p_up_s"],
+            p_dn_s=outputs["p_dn_s"],
+            thr_opt=outputs["thr_opt"],
+            entry=outputs["entry"],
+            sl=outputs["stop_loss"],
+            tp1=outputs["tp1"],
+            tp2=outputs["tp2"],
+            curve=outputs["curve"],
+            bh=outputs["bh"],
+            ticker=outputs["ticker"],
+            lookback=outputs["lookback"],
+            strat_name=outputs["strat_name"],
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with tabs[1]:
+        st.markdown("#### Detail Backtest (20 Hari Terakhir)")
+        oos_df = outputs["oos_df"]
+        if oos_df is not None and not oos_df.empty:
+            st.dataframe(
+                oos_df.tail(20),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Belum ada data OOS backtest yang valid.")
+
+    with tabs[2]:
+        st.markdown("#### Prediksi & Target Harga (T+1)")
+        st.write(
+            "Model ini **klasifikasi arah (Naik/Datar/Turun)**, bukan prediksi harga pasti.\n"
+            "Tabel di bawah menunjukkan probabilitas arah T+1 dan level target dari strategi."
+        )
+        st.dataframe(
+            outputs["pred_df"]
+            if "pred_df" in outputs
+            else pd.DataFrame(
+                {
+                    "Tanggal Prediksi": [data.index[-1].date()],
+                    "Tipe Strategi": [outputs["strat_name"]],
+                    "Prob. Naik": [f"{outputs['prob_up']:.2%}"],
+                    "Prob. Datar": [f"{outputs['prob_flat']:.2%}"],
+                    "Prob. Turun": [f"{outputs['prob_down']:.2%}"],
+                    "Target Entry": [f"{outputs['entry']:.2f}"],
+                    "Target SL": [f"{outputs['stop_loss']:.2f}"],
+                    "Target TP1": [f"{outputs['tp1']:.2f}"],
+                    "Target TP2": [f"{outputs['tp2']:.2f}"],
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabs[3]:
+        st.markdown("#### Classification Report & Confusion Matrix")
+        if outputs["cls_report"] is not None:
+            st.text(outputs["cls_report"])
+        if outputs["cm"] is not None:
+            st.write("Confusion Matrix:")
+            st.write(outputs["cm"])
+
+
+if __name__ == "__main__":
+    main()
